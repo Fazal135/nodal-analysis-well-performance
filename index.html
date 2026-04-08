@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nodal Analysis Simulator</title>
+    
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    
+    <!-- Babel for in-browser JSX compilation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Chart.js for plotting -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        .math-block {
+            background-color: #f8fafc;
+            padding: 0.75rem;
+            border-radius: 0.5rem;
+            border: 1px solid #e2e8f0;
+            font-family: monospace;
+            font-size: 0.875rem;
+            color: #334155;
+            margin-top: 0.5rem;
+            margin-bottom: 0.5rem;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- PHYSICS ENGINE & CORRELATIONS ---
+
+        // 1. IPR Calculation (Composite Vogel for Undersaturated Reservoirs)
+        // Matches Python: Qb = J*(Pr-Pb), Qvmax = (J*Pb)/1.8
+        const generateIPR = (Pr, Pb, J) => {
+            const iprData = [];
+            const step = Pr / 50;
+
+            const Qb = J * Math.max(0, Pr - Pb);
+            const Qv_max = (J * Pb) / 1.8;
+            const Qmax = Qb + Qv_max;
+
+            for (let Pwf = Pr; Pwf >= 0; Pwf -= step) {
+                let Q = 0;
+                if (Pwf >= Pb) {
+                    Q = J * (Pr - Pwf);
+                } else {
+                    const P_ratio = Pwf / Pb;
+                    Q = Qb + Qv_max * (1 - 0.2 * P_ratio - 0.8 * Math.pow(P_ratio, 2));
+                }
+                iprData.push({ x: Q, y: Pwf });
+            }
+
+            if (iprData[iprData.length - 1].y > 0) {
+                iprData.push({ x: Qmax, y: 0 });
+            }
+
+            return { iprData, Qmax };
+        };
+
+        // 2. TPR Calculation
+        // Matches Python notebook exactly:
+        //   - 50 integration steps (top-down, wellhead → bottomhole)
+        //   - Moody friction factor: f = 0.079 * Re^(-0.25)   [Blasius]
+        //   - Z = 0.9 (fixed)
+        //   - Bo = 1.05 + 0.0005 * Rs_sm3sm3  (Rs already in sm3/sm3)
+        //   - gamma_g = 0.7 (fixed), mu = 0.001 Pa·s
+        //   - Rs capped at GOR
+        const calculateTPRPoint = (Q_liq_sm3d, inputs, tubing_ID_m) => {
+            if (Q_liq_sm3d < 1e-6) Q_liq_sm3d = 0.1;
+
+            const WC = inputs.WC / 100;
+            const Qo = Q_liq_sm3d * (1 - WC);   // sm3/day oil
+            const Qw = Q_liq_sm3d * WC;           // sm3/day water
+            const Qg_total = Qo * inputs.GOR;     // sm3/day total gas at sc
+
+            const gamma_o = 141.5 / (131.5 + inputs.API);
+            const rho_o = gamma_o * 1000;          // kg/m3
+            const rho_w = 1000;                    // kg/m3
+            const gamma_g = 0.7;
+            const rho_g_sc = gamma_g * 1.225;      // kg/m3
+            const mu = 0.001;                      // Pa·s  (water viscosity proxy)
+
+            // Constant mass flow rate (kg/s)
+            const m_dot = (Qo * rho_o + Qw * rho_w + Qg_total * rho_g_sc) / 86400;
+
+            const Area = Math.PI * Math.pow(tubing_ID_m, 2) / 4;
+            const g = 9.81;
+
+            // Integration: wellhead (top) → bottomhole (bottom), 50 steps
+            const steps = 50;
+            const dz = inputs.Depth / steps;
+            const dT = (inputs.Tbh - inputs.Twh) / steps;
+
+            let P = inputs.Pwh;   // bar
+            let T = inputs.Twh;   // °C
+
+            for (let i = 0; i < steps; i++) {
+                const P_psi = P * 14.5038;
+                const T_F   = T * 9 / 5 + 32;
+
+                // Standing's Rs (scf/bbl)
+                let Rs_scf_bbl = gamma_g * Math.pow(
+                    (P_psi / 18.2 + 1.4) * Math.pow(10, 0.0125 * inputs.API - 0.00091 * T_F),
+                    1.2048
+                );
+                // Convert to sm3/sm3
+                let Rs = Rs_scf_bbl / 5.615;
+                if (Rs > inputs.GOR) Rs = inputs.GOR;   // cap at initial GOR
+
+                // Free gas (sm3/day)
+                const Qg_free = Math.max(0, Qo * (inputs.GOR - Rs));
+
+                // PVT
+                const T_K = T + 273.15;
+                const Z  = 0.9;                          // fixed compressibility
+                const Bg = (1.01325 / P) * (T_K / 288.15) * Z;   // m3/sm3
+                const Bo = 1.05 + 0.0005 * Rs;           // Rs in sm3/sm3 (matches Python)
+                const Bw = 1.0;
+
+                // In-situ flow rates (m3/s)
+                const qo = (Qo * Bo)     / 86400;
+                const qw = (Qw * Bw)     / 86400;
+                const qg = (Qg_free * Bg) / 86400;
+                const q_total = qo + qw + qg;
+
+                // Mixture properties
+                const rho_mix = m_dot / q_total;         // kg/m3
+                const v_mix   = q_total / Area;           // m/s
+
+                // Blasius / Moody friction factor: f = 0.079 * Re^(-0.25)
+                const Re = (rho_mix * v_mix * tubing_ID_m) / mu;
+                const f  = 0.079 * Math.pow(Re, -0.25);
+
+                // Pressure gradient (Pa/m)
+                const dp_dz = rho_mix * g + (f * rho_mix * Math.pow(v_mix, 2)) / (2 * tubing_ID_m);
+
+                // Update P (Pa → bar: divide by 1e5)
+                P += (dp_dz * dz) / 1e5;
+
+                // Linear temperature gradient
+                T += dT;
+            }
+
+            return P;
+        };
+
+        const generateTPR = (Qmax, inputs) => {
+            const tprData = [];
+            const idMap = {
+                "2.375": 1.995 * 0.0254,
+                "2.875": 2.441 * 0.0254,
+                "3.5":   2.992 * 0.0254
+            };
+            const tubing_ID_m = idMap[inputs.Tubing];
+
+            // Start from Q=10 (like Python np.linspace(10, Qmax, 30))
+            // This avoids the near-zero regime where TPR is artificially high
+            const numPts = 30;
+            const Qstart = 10;
+            const step = (Qmax * 1.2 - Qstart) / (numPts - 1);
+            for (let k = 0; k < numPts; k++) {
+                const Q = Qstart + k * step;
+                const Pwf = calculateTPRPoint(Q, inputs, tubing_ID_m);
+                tprData.push({ x: Q, y: Pwf });
+            }
+            return tprData;
+        };
+
+        // 3. Find Intersection (Operational Point)
+        // Strategy: scan along the SHARED Q range. The TRUE intersection is where
+        // IPR goes from ABOVE TPR to BELOW TPR (IPR_P > TPR_P → IPR_P < TPR_P).
+        // We skip the spurious early crossing by only accepting the sign change
+        // in the correct direction (IPR above → below, i.e. diff goes + → -).
+        const findIntersection = (ipr, tpr) => {
+            // Build a unified Q array spanning both curves
+            const Qmin = Math.max(ipr[0].x, tpr[0].x);
+            const Qmax = Math.min(ipr[ipr.length-1].x, tpr[tpr.length-1].x);
+
+            const nScan = 200;
+            const dQ = (Qmax - Qmin) / nScan;
+
+            let prevDiff = null;
+            let prevQ = null;
+            let intersect = null;
+
+            for (let k = 0; k <= nScan; k++) {
+                const Q = Qmin + k * dQ;
+                const p_ipr = calculateInterpolatedY(ipr, Q);
+                const p_tpr = calculateInterpolatedY(tpr, Q);
+                const diff = p_ipr - p_tpr;
+
+                if (prevDiff !== null && prevDiff * diff < 0) {
+                    // Sign change detected — interpolate exact crossing
+                    const ratio = prevDiff / (prevDiff - diff);
+                    const Qcross = prevQ + ratio * dQ;
+                    const Pcross = calculateInterpolatedY(ipr, Qcross);
+
+                    // Only accept if this is the IPR-above → IPR-below crossing
+                    // (prevDiff > 0 means IPR was above TPR before this point)
+                    // This filters out the false crossing at low Q where
+                    // both curves start high and TPR > IPR initially.
+                    if (prevDiff > 0) {
+                        intersect = { x: Qcross, y: Pcross };
+                        break;
+                    }
+                }
+
+                prevDiff = diff;
+                prevQ = Q;
+            }
+            return intersect;
+        };
+
+        const calculateInterpolatedY = (curve, xTarget) => {
+            for (let i = 0; i < curve.length - 1; i++) {
+                if (xTarget >= curve[i].x && xTarget <= curve[i + 1].x) {
+                    const ratio = (xTarget - curve[i].x) / (curve[i + 1].x - curve[i].x);
+                    return curve[i].y + ratio * (curve[i + 1].y - curve[i].y);
+                }
+            }
+            return curve[curve.length - 1].y;
+        };
+
+
+        // --- MAIN REACT COMPONENT ---
+        const App = () => {
+            const [inputs, setInputs] = useState({
+                Pr:     280,      // Reservoir Pressure (bar)
+                Pb:     210,      // Bubble Point (bar)
+                API:    32,       // API Gravity
+                GOR:    120,      // sm3/sm3
+                WC:     40,       // %
+                Depth:  3200,     // m
+                Tubing: "2.875",  // 2 7/8"
+                Tbh:    95,       // Bottomhole Temp (°C)
+                J:      3.5,      // Productivity Index (m3/d/bar)
+                Pwh:    20,       // Wellhead Pressure (bar)
+                Twh:    30        // Wellhead Temp (°C)
+            });
+
+            const chartRef       = useRef(null);
+            const chartInstance  = useRef(null);
+            const [results, setResults] = useState(null);
+
+            const handleInputChange = (e) => {
+                const { name, value } = e.target;
+                setInputs(prev => ({
+                    ...prev,
+                    [name]: name === "Tubing" ? value : parseFloat(value) || 0
+                }));
+            };
+
+            useEffect(() => {
+                const { iprData, Qmax } = generateIPR(inputs.Pr, inputs.Pb, inputs.J);
+                const tprData = generateTPR(Qmax, inputs);
+                const intersection = findIntersection(iprData, tprData);
+
+                setResults({
+                    Qop: intersection ? intersection.x.toFixed(1) : "N/A (No Flow)",
+                    Pop: intersection ? intersection.y.toFixed(1) : "N/A"
+                });
+
+                const ctx = chartRef.current.getContext('2d');
+                if (chartInstance.current) chartInstance.current.destroy();
+
+                const datasets = [
+                    {
+                        label: 'IPR (Inflow)',
+                        data: iprData,
+                        borderColor: '#2563eb',
+                        backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                        borderWidth: 2,
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        showLine: true
+                    },
+                    {
+                        label: 'TPR (Outflow)',
+                        data: tprData,
+                        borderColor: '#dc2626',
+                        backgroundColor: 'rgba(220, 38, 38, 0.1)',
+                        borderWidth: 2,
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        showLine: true
+                    }
+                ];
+
+                if (intersection) {
+                    datasets.push({
+                        label: 'Operating Point',
+                        data: [intersection],
+                        backgroundColor: '#16a34a',
+                        borderColor: '#15803d',
+                        pointRadius: 6,
+                        pointHoverRadius: 8,
+                        showLine: false
+                    });
+                }
+
+                chartInstance.current = new Chart(ctx, {
+                    type: 'scatter',
+                    data: { datasets },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: {
+                                title: { display: true, text: 'Flow Rate, Q (sm³/day)', font: { weight: 'bold' } },
+                                min: 0,
+                                max: Qmax * 1.1
+                            },
+                            y: {
+                                title: { display: true, text: 'Bottomhole Pressure, Pwf (bar)', font: { weight: 'bold' } },
+                                min: 0,
+                                max: Math.max(inputs.Pr, tprData[0]?.y || 0) + 20
+                            }
+                        },
+                        plugins: {
+                            tooltip: {
+                                callbacks: {
+                                    label: (ctx) => `Q: ${ctx.parsed.x.toFixed(1)}, P: ${ctx.parsed.y.toFixed(1)}`
+                                }
+                            },
+                            legend: { position: 'top' }
+                        }
+                    }
+                });
+
+                return () => { if (chartInstance.current) chartInstance.current.destroy(); };
+            }, [inputs]);
+
+            return (
+                <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
+
+                    {/* Header */}
+                    <header className="mb-8">
+                        <h1 className="text-3xl font-bold text-slate-900 mb-2">1. Nodal Analysis</h1>
+                        <p className="text-slate-600">Group: Ashik Anil (22EX5PE04), Fazal Rab Abdali (22EX5PE02), Soutik NASKAR (22CH3PE01)</p>
+                    </header>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+                        {/* LEFT PANEL: Inputs */}
+                        <div className="lg:col-span-1 space-y-6 bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                            <h2 className="text-xl font-semibold text-slate-800 border-b pb-2">Well & Reservoir Data</h2>
+
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">Reservoir Pres. (bar)</label>
+                                        <input type="number" name="Pr" value={inputs.Pr} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">Bubble Point (bar)</label>
+                                        <input type="number" name="Pb" value={inputs.Pb} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">API Gravity</label>
+                                        <input type="number" name="API" value={inputs.API} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">GOR (sm³/sm³)</label>
+                                        <input type="number" name="GOR" value={inputs.GOR} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">Water Cut (%)</label>
+                                        <input type="number" name="WC" value={inputs.WC} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">Depth (m)</label>
+                                        <input type="number" name="Depth" value={inputs.Depth} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">Tubing Size</label>
+                                        <select name="Tubing" value={inputs.Tubing} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border bg-white">
+                                            <option value="2.375">2 3/8" (ID 1.995")</option>
+                                            <option value="2.875">2 7/8" (ID 2.441")</option>
+                                            <option value="3.5">3 1/2" (ID 2.992")</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-500 uppercase">BH Temp (°C)</label>
+                                        <input type="number" name="Tbh" value={inputs.Tbh} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                    </div>
+                                </div>
+
+                                <div className="pt-4 mt-4 border-t border-slate-200">
+                                    <h3 className="text-sm font-semibold text-slate-600 mb-3">Assumed Parameters (Not in Dataset)</h3>
+                                    <div className="space-y-4">
+                                        <div>
+                                            <label className="block text-xs font-medium text-slate-500 uppercase">Prod. Index, J (sm³/d/bar)</label>
+                                            <input type="range" name="J" min="0.5" max="20" step="0.5" value={inputs.J} onChange={handleInputChange} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer mt-2" />
+                                            <div className="text-right text-sm text-slate-600">{inputs.J}</div>
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-xs font-medium text-slate-500 uppercase">Wellhead Pres. (bar)</label>
+                                                <input type="number" name="Pwh" value={inputs.Pwh} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs font-medium text-slate-500 uppercase">Wellhead Temp (°C)</label>
+                                                <input type="number" name="Twh" value={inputs.Twh} onChange={handleInputChange} className="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* RIGHT PANEL: Graph and Results */}
+                        <div className="lg:col-span-2 flex flex-col gap-6">
+
+                            {/* Results Cards */}
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col items-center justify-center">
+                                    <span className="text-sm text-slate-500 uppercase tracking-wider font-semibold">Operating Rate (Q)</span>
+                                    <span className="text-3xl font-bold text-green-600 mt-1">{results?.Qop}</span>
+                                    <span className="text-xs text-slate-400 mt-1">sm³/day</span>
+                                </div>
+                                <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col items-center justify-center">
+                                    <span className="text-sm text-slate-500 uppercase tracking-wider font-semibold">Operating BHP (Pwf)</span>
+                                    <span className="text-3xl font-bold text-blue-600 mt-1">{results?.Pop}</span>
+                                    <span className="text-xs text-slate-400 mt-1">bar</span>
+                                </div>
+                            </div>
+
+                            {/* Chart Container */}
+                            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex-grow" style={{ minHeight: '400px' }}>
+                                <canvas ref={chartRef}></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* THEORY SECTION */}
+                    <div className="mt-8 bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-8">
+                        <h2 className="text-2xl font-bold text-slate-800 border-b pb-4">Underlying Theory & Mathematical Models</h2>
+
+                        {/* Section 1: IPR */}
+                        <div>
+                            <h3 className="text-xl font-semibold text-blue-700 mb-3">1. Inflow Performance Relationship (IPR)</h3>
+                            <p className="text-sm text-slate-700 mb-3 leading-relaxed">
+                                The IPR represents the reservoir's ability to deliver fluids to the wellbore. Since the initial reservoir pressure (P<sub>R</sub> = 280 bar) is higher than the bubble point (P<sub>b</sub> = 210 bar), this is an <strong>Undersaturated Reservoir</strong>. We use the <strong>Composite Vogel Equation</strong>. The key intermediate quantities are first calculated:
+                            </p>
+                            <div className="math-block text-blue-700">
+                                Q<sub>b</sub> = J &times; (P<sub>R</sub> &minus; P<sub>b</sub>) &nbsp;|&nbsp; Q<sub>vmax</sub> = (J &times; P<sub>b</sub>) / 1.8 &nbsp;|&nbsp; Q<sub>max</sub> = Q<sub>b</sub> + Q<sub>vmax</sub>
+                            </div>
+                            <ul className="list-disc list-inside text-sm text-slate-700 space-y-2 mt-2">
+                                <li><strong>Above Bubble Point (P<sub>wf</sub> &ge; P<sub>b</sub>):</strong> Single-phase liquid, linear Darcy flow:
+                                    <div className="math-block text-blue-700">Q = J &times; (P<sub>R</sub> &minus; P<sub>wf</sub>)</div>
+                                </li>
+                                <li><strong>Below Bubble Point (P<sub>wf</sub> &lt; P<sub>b</sub>):</strong> Two-phase flow; gas liberates and causes additional resistance. Vogel's empirical correlation is used:
+                                    <div className="math-block text-blue-700">Q = Q<sub>b</sub> + Q<sub>vmax</sub> &times; [1 &minus; 0.2(P<sub>wf</sub>/P<sub>b</sub>) &minus; 0.8(P<sub>wf</sub>/P<sub>b</sub>)&sup2;]</div>
+                                </li>
+                            </ul>
+                        </div>
+
+                        {/* Section 2: TPR */}
+                        <div>
+                            <h3 className="text-xl font-semibold text-red-700 mb-3">2. Tubing Performance Relationship (TPR)</h3>
+                            <p className="text-sm text-slate-700 mb-3 leading-relaxed">
+                                The TPR curve (Outflow curve) gives the bottomhole pressure required to lift fluids at a given rate. Oil, water, and gas flow together up the tubing, so pressure and temperature change continuously — causing gas to expand and altering mixture density and velocity. We solve this by <strong>numerical integration from wellhead to bottomhole in 50 equal depth steps</strong>.
+                            </p>
+
+                            <div className="space-y-4">
+                                <div>
+                                    <h4 className="font-semibold text-slate-800 text-sm">A. Mass Flow Rate (Constant Throughout Tubing)</h4>
+                                    <p className="text-sm text-slate-700">Computed at standard conditions using stock-tank densities. This remains fixed at every depth step since mass is conserved.</p>
+                                    <div className="math-block text-red-700">
+                                        &gamma;<sub>o</sub> = 141.5 / (131.5 + API) &nbsp;&nbsp; &rho;<sub>o</sub> = 1000 &middot; &gamma;<sub>o</sub> &nbsp; [kg/m&sup3;]<br/><br/>
+                                        ṁ = (Q<sub>o</sub> &middot; &rho;<sub>o</sub> + Q<sub>w</sub> &middot; &rho;<sub>w</sub> + Q<sub>g,sc</sub> &middot; &rho;<sub>g,sc</sub>) / 86400 &nbsp; [kg/s]
+                                    </div>
+                                    <p className="text-xs text-slate-500 mt-1">Where &rho;<sub>g,sc</sub> = &gamma;<sub>g</sub> &times; 1.225 kg/m&sup3;, with &gamma;<sub>g</sub> = 0.7 (fixed)</p>
+                                </div>
+
+                                <div>
+                                    <h4 className="font-semibold text-slate-800 text-sm">B. PVT at Each Depth Step</h4>
+                                    <p className="text-sm text-slate-700 mb-2">At each step, local P and T are used to compute in-situ fluid volumes.</p>
+                                    <ul className="list-disc list-inside text-sm text-slate-700 space-y-2">
+                                        <li><strong>Solution GOR — Standing's Correlation:</strong>
+                                            <div className="math-block">
+                                                R<sub>s</sub> [scf/bbl] = &gamma;<sub>g</sub> &times; [(P<sub>psi</sub>/18.2 + 1.4) &times; 10<sup>(0.0125&thinsp;API &minus; 0.00091&thinsp;T<sub>°F</sub>)</sup>]<sup>1.2048</sup><br/>
+                                                R<sub>s</sub> [sm&sup3;/sm&sup3;] = R<sub>s</sub> [scf/bbl] / 5.615 &nbsp;&nbsp; (capped at GOR)
+                                            </div>
+                                        </li>
+                                        <li><strong>Free Gas:</strong>
+                                            <div className="math-block">Q<sub>g,free</sub> = max(0, Q<sub>o</sub> &times; (GOR &minus; R<sub>s</sub>)) &nbsp; [sm&sup3;/day]</div>
+                                        </li>
+                                        <li><strong>Formation Volume Factors (Z = 0.9 fixed):</strong>
+                                            <div className="math-block">
+                                                B<sub>g</sub> = (1.01325 / P) &times; (T<sub>K</sub> / 288.15) &times; Z &nbsp; [m&sup3;/sm&sup3;]<br/>
+                                                B<sub>o</sub> = 1.05 + 0.0005 &times; R<sub>s</sub> &nbsp; (R<sub>s</sub> in sm&sup3;/sm&sup3;)<br/>
+                                                B<sub>w</sub> = 1.0
+                                            </div>
+                                        </li>
+                                        <li><strong>In-Situ Total Flow Rate & Mixture Properties:</strong>
+                                            <div className="math-block">
+                                                q<sub>total</sub> = (Q<sub>o</sub>B<sub>o</sub> + Q<sub>w</sub>B<sub>w</sub> + Q<sub>g,free</sub>B<sub>g</sub>) / 86400 &nbsp;[m&sup3;/s]<br/>
+                                                v<sub>mix</sub> = q<sub>total</sub> / A &nbsp;[m/s] &nbsp;&nbsp; &rho;<sub>mix</sub> = ṁ / q<sub>total</sub> &nbsp;[kg/m&sup3;]
+                                            </div>
+                                        </li>
+                                    </ul>
+                                </div>
+
+                                <div>
+                                    <h4 className="font-semibold text-slate-800 text-sm">C. Friction Factor — Blasius (Moody) Correlation</h4>
+                                    <p className="text-sm text-slate-700">The Blasius turbulent-flow friction factor is used (valid for smooth pipes, Re &lt; 10<sup>5</sup>):</p>
+                                    <div className="math-block text-red-700">
+                                        Re = (&rho;<sub>mix</sub> &middot; v<sub>mix</sub> &middot; D) / &mu; &nbsp;&nbsp; (&mu; = 0.001 Pa&middot;s)<br/><br/>
+                                        f = 0.079 &times; Re<sup>&minus;0.25</sup>
+                                    </div>
+                                    <p className="text-xs text-slate-500 mt-1">This replaces the old constant friction factor approach, giving a physically consistent result that varies with flow rate and mixture density.</p>
+                                </div>
+
+                                <div>
+                                    <h4 className="font-semibold text-slate-800 text-sm">D. Pressure Gradient & Numerical Integration</h4>
+                                    <p className="text-sm text-slate-700">Total pressure gradient per metre of depth = hydrostatic + friction (acceleration term neglected):</p>
+                                    <div className="math-block text-red-700">
+                                        dP/dz = &rho;<sub>mix</sub> &middot; g &nbsp;+&nbsp; (f &middot; &rho;<sub>mix</sub> &middot; v<sub>mix</sub>&sup2;) / (2D) &nbsp; [Pa/m]<br/><br/>
+                                        P<sub>i+1</sub> = P<sub>i</sub> + (dP/dz &times; &Delta;z) / 10<sup>5</sup> &nbsp; [bar]
+                                    </div>
+                                    <p className="text-sm text-slate-700 mt-2">Starting from P<sub>wh</sub> at the surface, this loop runs 50 steps of &Delta;z = depth/50 downward, yielding P<sub>wf</sub> at bottomhole. Temperature increases linearly from T<sub>wh</sub> to T<sub>bh</sub>. Repeating for 30 flow rate values builds the TPR curve.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Section 3: Operating Point */}
+                        <div className="pt-2">
+                            <h3 className="text-xl font-semibold text-green-700 mb-2">3. The Operating Point</h3>
+                            <p className="text-sm text-slate-700 leading-relaxed">
+                                The intersection of the IPR and TPR curves is the <strong>Natural Flowing Operating Point</strong>. At this coordinate (Q<sub>op</sub>, P<sub>wf,op</sub>), the energy supplied by the reservoir exactly matches the energy consumed lifting fluids to the surface. The point is found by linear interpolation between successive curve points where the sign of (P<sub>IPR</sub> &minus; P<sub>TPR</sub>) changes. If no intersection exists, the well cannot flow naturally and requires artificial lift.
+                            </p>
+                        </div>
+                    </div>
+
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
